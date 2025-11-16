@@ -1,0 +1,22 @@
+# Ignorar todo por defecto
+/*
+
+# Excepto la carpeta arbitrage
+!/arbitrage/
+!/arbitrage/**
+
+# Excepto el propio .gitignore
+!.gitignore
+
+# Ignorar node_modules dentro de arbitrage si existe
+arbitrage/node_modules/
+
+# Ignorar archivos de credenciales sensibles
+arbitrage/credenciales.js
+arbitrage/**/credenciales.js
+arbitrage/**/*.env
+arbitrage/**/.env
+
+# Ignorar logs
+arbitrage/**/*.log
+arbitrage/**/logs/
