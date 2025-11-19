@@ -1,18 +1,20 @@
 /**
- * 🎯 GESTOR ESCALONADO DE OFERTAS - QvaPay P2P
+ * 🎯 GESTOR ESCALONADO DE COMPRAS - QvaPay P2P
  * 
- * Crea ofertas en escalas progresivas: 1, 2, 3, 5, 10, 15, 20, 25, 30...
- * Cuando no hay capital suficiente, fracciona el restante.
+ * Crea ofertas de COMPRA en escalas progresivas: 1, 2, 3, 5, 10, 15, 20, 25, 30...
+ * Usa tu balance en CUP disponible para calcular cuántas ofertas crear.
  * 
  * Estrategia:
- * 1. Obtener balance disponible
- * 2. Crear ofertas siguiendo la escala predefinida
- * 3. Si no alcanza para la siguiente escala, fracciona el restante
- * 4. Repite el proceso constantemente
+ * 1. Obtener balance disponible en CUP
+ * 2. Calcular precio óptimo de compra (yo compro USD)
+ * 3. Crear ofertas siguiendo la escala predefinida
+ * 4. Si no alcanza para la siguiente escala, fracciona el restante
+ * 5. Detecta peers y renueva ofertas automáticamente
  */
 
 const fetch = require('node-fetch');
 const config = require('./config-gestor-ofertas');
+const configCompra = require('./config-gestor-compra');
 const { calcularPreciosPorMoneda } = require('./utils/calcular-precios');
 const { aplicarFiltrosEstandar } = require('./utils/filtros');
 const { obtenerConfiguracionEstrategia } = require('./config-estrategia');
@@ -26,17 +28,28 @@ const {
     necesitaRenovacion
 } = require('./utils/api-ofertas');
 const { obtenerBalance } = require('./utils/usuario');
-const { notificarOportunidad } = require('./utils/notificaciones');
+const { enviarPorTelegram } = require('./utils/notificaciones');
 
 // 📊 ESCALA DE OFERTAS (en USD)
 const ESCALA_OFERTAS = [1, 2, 3, 5, 10, 15, 20, 25, 30, 40, 50, 75, 100];
 
-// Configuración
-const TIPO_OFERTA = 'venta'; // 'compra' o 'venta'
+// ⚙️ CONFIGURACIÓN
+const TIPO_OFERTA = 'compra'; // FIJO: compra de USD
 const MONEDA = 'BANK_CUP';
 const INTERVALO_ESCANEO = 60; // segundos
 const TIEMPO_MAX_SIN_PEER = 10; // minutos
 const DELAY_ENTRE_OFERTAS = 10000; // milisegundos (3 segundos) entre crear ofertas
+
+// 💰 CONFIGURACIÓN DE CAPITAL
+// Puedes configurar esto de dos formas:
+// 1. BALANCE_CUP_DISPONIBLE: null -> Usa todo el balance en CUP
+// 2. BALANCE_CUP_DISPONIBLE: 10000 -> Usa solo 10000 CUP
+//
+// ⚠️ IMPORTANTE: Si configuras un valor manual, el gestor NO verificará
+// si tienes suficiente CUP. Asegúrate de tener al menos ese monto disponible.
+//
+// 📁 CONFIGURACIÓN: Edita el archivo config-gestor-compra.js
+const BALANCE_CUP_DISPONIBLE = configCompra.balanceCupManual || process.env.BALANCE_CUP_MANUAL || null;
 
 // Estadísticas
 let estadisticas = {
@@ -48,10 +61,7 @@ let estadisticas = {
 };
 
 // Caché de peers detectados para evitar notificaciones duplicadas
-// Estructura: { ofertaId: { peer_uuid, timestamp } }
 const peersNotificados = new Map();
-
-// Tiempo para limpiar el caché (30 minutos)
 const TIEMPO_CACHE_MS = 30 * 60 * 1000;
 
 /**
@@ -63,105 +73,6 @@ function limpiarCachePeers() {
         if (ahora - value.timestamp > TIEMPO_CACHE_MS) {
             peersNotificados.delete(key);
         }
-    }
-}
-
-/**
- * Notificar cuando se detecta un peer en una oferta
- */
-async function notificarPeerDetectado(oferta) {
-    const ofertaId = oferta.uuid;
-    const peerUuid = oferta.peer ? oferta.peer.uuid : null;
-    
-    if (!peerUuid) return;
-    
-    // Verificar si ya notificamos sobre este peer en esta oferta
-    const cacheKey = `${ofertaId}-${peerUuid}`;
-    if (peersNotificados.has(cacheKey)) {
-        return; // Ya notificado
-    }
-    
-    // Registrar en caché
-    peersNotificados.set(cacheKey, {
-        peer_uuid: peerUuid,
-        timestamp: Date.now()
-    });
-    
-    estadisticas.peersDetectados++;
-    
-    // Preparar mensaje
-    const tipo = oferta.type === 'sell' ? 'VENTA' : 'COMPRA';
-    const emoji = oferta.type === 'sell' ? '🔴' : '🟢';
-    const peerUsername = oferta.peer.username || 'Desconocido';
-    const amount = parseFloat(oferta.amount);
-    const receive = parseFloat(oferta.receive);
-    const tasa = (receive / amount).toFixed(2);
-    
-    let mensaje = `${emoji} <b>PEER DETECTADO - ${tipo}</b>\n\n`;
-    mensaje += `🆔 Oferta: ${ofertaId.substring(0, 8)}...\n`;
-    mensaje += `💰 Monto: ${amount} USD → ${receive} CUP\n`;
-    mensaje += `📊 Tasa: ${tasa} CUP/USD\n`;
-    mensaje += `👤 Peer: @${peerUsername}\n`;
-    mensaje += `⏰ ${new Date().toLocaleTimeString('es-ES')}`;
-    
-    console.log(`\n   🎉 ¡PEER DETECTADO! Oferta ${ofertaId.substring(0, 8)}... - @${peerUsername}`);
-    console.log(`   📲 Enviando notificación...`);
-    
-    try {
-        await enviarPorTelegram(mensaje);
-        console.log(`   ✅ Notificación enviada`);
-    } catch (error) {
-        console.log(`   ⚠️  Error al enviar notificación: ${error.message}`);
-    }
-    
-    // Limpiar caché cada vez que notificamos
-    limpiarCachePeers();
-}
-
-/**
- * Notificar cuando se crea una oferta
- */
-async function notificarOfertaCreada(oferta, cantidadUSD, cantidadCUP, tasa) {
-    const tipo = TIPO_OFERTA === 'venta' ? 'VENTA' : 'COMPRA';
-    const emoji = TIPO_OFERTA === 'venta' ? '🔴' : '🟢';
-    
-    let mensaje = `${emoji} <b>OFERTA CREADA - ${tipo}</b>\n\n`;
-    mensaje += `🆔 ID: ${oferta.uuid.substring(0, 8)}...\n`;
-    mensaje += `💰 Monto: ${cantidadUSD} USD → ${cantidadCUP} CUP\n`;
-    mensaje += `📊 Tasa: ${tasa.toFixed(2)} CUP/USD\n`;
-    mensaje += `💵 Moneda: ${MONEDA}\n`;
-    mensaje += `⏰ ${new Date().toLocaleTimeString('es-ES')}`;
-    
-    try {
-        await enviarPorTelegram(mensaje);
-    } catch (error) {
-        console.log(`   ⚠️  Error al enviar notificación: ${error.message}`);
-    }
-}
-
-/**
- * Notificar cuando se renueva una oferta
- */
-async function notificarOfertaRenovada(ofertaVieja, ofertaNueva, edad) {
-    const tipo = TIPO_OFERTA === 'venta' ? 'VENTA' : 'COMPRA';
-    const emoji = '🔄';
-    
-    const amount = parseFloat(ofertaNueva.amount);
-    const receive = parseFloat(ofertaNueva.receive);
-    const tasa = (receive / amount).toFixed(2);
-    
-    let mensaje = `${emoji} <b>OFERTA RENOVADA - ${tipo}</b>\n\n`;
-    mensaje += `🆔 ID anterior: ${ofertaVieja.substring(0, 8)}...\n`;
-    mensaje += `🆔 ID nueva: ${ofertaNueva.uuid.substring(0, 8)}...\n`;
-    mensaje += `💰 Monto: ${amount} USD → ${receive} CUP\n`;
-    mensaje += `📊 Tasa: ${tasa} CUP/USD\n`;
-    mensaje += `⏱️  Sin peer por: ${edad} minutos\n`;
-    mensaje += `⏰ ${new Date().toLocaleTimeString('es-ES')}`;
-    
-    try {
-        await enviarPorTelegram(mensaje);
-    } catch (error) {
-        console.log(`   ⚠️  Error al enviar notificación: ${error.message}`);
     }
 }
 
@@ -225,18 +136,63 @@ async function calcularPreciosReferencia() {
 }
 
 /**
- * Calcular cantidades de ofertas necesarias según balance
+ * Obtener balance disponible en CUP
+ * Si tienes múltiples cuentas, suma los CUP disponibles
  */
-function calcularOfertasNecesarias(balanceDisponible, ofertasExistentes, maxOfertasPermitidas) {
+async function obtenerBalanceCUP() {
+    try {
+        const response = await fetch('https://qvapay.com/api/v1/balance', {
+            headers: {
+                'Accept': 'application/json',
+                'Authorization': `Bearer ${config.token}`
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        
+        // Buscar balance en CUP
+        // La API retorna un array de balances por moneda
+        let totalCUP = 0;
+        
+        if (Array.isArray(data)) {
+            for (const item of data) {
+                // Buscar CUP, BANK_CUP, etc.
+                if (item.coin && (item.coin.toUpperCase().includes('CUP'))) {
+                    totalCUP += parseFloat(item.balance || 0);
+                }
+            }
+        }
+        
+        return totalCUP;
+        
+    } catch (error) {
+        console.error('❌ Error al obtener balance CUP:', error.message);
+        return 0;
+    }
+}
+
+/**
+ * Calcular cantidades de ofertas necesarias según balance en CUP
+ */
+function calcularOfertasNecesarias(balanceCUP, precioCompra, ofertasExistentes, maxOfertasPermitidas) {
     const ofertasACrear = [];
-    let capitalRestante = balanceDisponible;
+    
+    // Calcular cuánto USD puedo comprar con mi CUP disponible
+    const usdDisponible = balanceCUP / precioCompra;
+    let capitalRestante = usdDisponible;
     
     // Obtener cantidades ya existentes
     const cantidadesExistentes = ofertasExistentes
         .filter(o => o.status === 'open' && !o.peer_id)
         .map(o => parseFloat(o.amount));
     
-    console.log(`\n   💰 Balance disponible: $${balanceDisponible.toFixed(2)}`);
+    console.log(`\n   💰 Balance CUP: ${balanceCUP.toFixed(2)} CUP`);
+    console.log(`   💵 Equivalente USD: $${usdDisponible.toFixed(2)}`);
+    console.log(`   📊 Precio compra: ${precioCompra.toFixed(2)} CUP/USD`);
     console.log(`   📊 Ofertas activas: ${cantidadesExistentes.length}`);
     console.log(`   🎯 Límite máximo: ${maxOfertasPermitidas} ofertas`);
     if (cantidadesExistentes.length > 0) {
@@ -258,14 +214,14 @@ function calcularOfertasNecesarias(balanceDisponible, ofertasExistentes, maxOfer
         const capitalPorOferta = capitalRestante / ofertasDisponibles;
         console.log(`   💵 Capital por oferta: $${capitalPorOferta.toFixed(2)}`);
         
-        // Crear ofertas de la escala que quepan en el capital por oferta
+        // Recorrer la escala
         for (const cantidad of ESCALA_OFERTAS) {
             // Si ya existe una oferta con esta cantidad, saltar
             if (cantidadesExistentes.includes(cantidad)) {
                 continue;
             }
             
-            // Si tenemos capital suficiente para esta cantidad, agregarla
+            // Si tenemos capital suficiente, agregarla
             if (capitalRestante >= cantidad && ofertasACrear.length < ofertasDisponibles) {
                 ofertasACrear.push(cantidad);
                 capitalRestante -= cantidad;
@@ -274,7 +230,6 @@ function calcularOfertasNecesarias(balanceDisponible, ofertasExistentes, maxOfer
         
         // Si sobra capital y aún tenemos espacios, fraccionarlo
         if (capitalRestante >= 1 && ofertasACrear.length < ofertasDisponibles) {
-            // Intentar crear ofertas fraccionadas
             const fraccionada = Math.floor(capitalRestante);
             if (fraccionada >= 1 && !cantidadesExistentes.includes(fraccionada)) {
                 ofertasACrear.push(fraccionada);
@@ -293,63 +248,35 @@ function calcularOfertasNecesarias(balanceDisponible, ofertasExistentes, maxOfer
 }
 
 /**
- * Crear oferta
+ * Crear oferta de compra
  */
-async function crearOfertaEscalonada(cantidadUSD, preciosReferencia) {
-    const preciosMoneda = preciosReferencia[MONEDA];
+async function crearOfertaCompra(cantidadUSD, precioCompra) {
+    const cantidadCUP = parseFloat((cantidadUSD * precioCompra).toFixed(2));
     
-    if (!preciosMoneda) {
-        console.log(`   ⚠️  No hay precios de referencia para ${MONEDA}`);
-        return null;
-    }
+    // YO COMPRO USD (doy CUP, recibo USD)
+    const datosOferta = {
+        type: 'buy',  // buy = yo compro USD
+        coin: MONEDA,
+        amount: cantidadUSD,      // USD que quiero comprar
+        receive: cantidadCUP,     // CUP que voy a pagar
+        details: config.ofertas[0].detallesPago,
+        only_kyc: config.ofertas[0].soloKYC ? 1 : 0,
+        private: config.ofertas[0].privada ? 1 : 0,
+        only_vip: config.ofertas[0].soloVIP ? 1 : 0,
+        message: config.ofertas[0].mensaje || undefined
+    };
     
-    const precioOptimo = TIPO_OFERTA === 'venta' 
-        ? preciosMoneda.precios.venta 
-        : preciosMoneda.precios.compra;
-    
-    const cantidadCUP = parseFloat((cantidadUSD * precioOptimo).toFixed(2));
-    
-    // Preparar datos según tipo de oferta
-    let datosOferta;
-    if (TIPO_OFERTA === 'venta') {
-        // YO VENDO USD (doy USD, recibo CUP)
-        datosOferta = {
-            type: 'sell',  // CORRECTO: sell = yo vendo USD
-            coin: MONEDA,
-            amount: cantidadUSD,
-            receive: cantidadCUP,
-            details: config.ofertas[0].detallesPago,
-            only_kyc: config.ofertas[0].soloKYC ? 1 : 0,
-            private: config.ofertas[0].privada ? 1 : 0,
-            only_vip: config.ofertas[0].soloVIP ? 1 : 0,
-            message: config.ofertas[0].mensaje || undefined
-        };
-    } else {
-        // YO COMPRO USD (doy CUP, recibo USD)
-        datosOferta = {
-            type: 'buy',  // CORRECTO: buy = yo compro USD
-            coin: MONEDA,
-            amount: cantidadUSD,
-            receive: cantidadCUP,
-            details: config.ofertas[0].detallesPago,
-            only_kyc: config.ofertas[0].soloKYC ? 1 : 0,
-            private: config.ofertas[0].privada ? 1 : 0,
-            only_vip: config.ofertas[0].soloVIP ? 1 : 0,
-            message: config.ofertas[0].mensaje || undefined
-        };
-    }
-    
-    console.log(`   📝 Creando oferta: $${cantidadUSD} USD → ${cantidadCUP} CUP (${precioOptimo.toFixed(2)} CUP/USD)`);
+    console.log(`   📝 Creando oferta COMPRA: $${cantidadUSD} USD por ${cantidadCUP} CUP (${precioCompra.toFixed(2)} CUP/USD)`);
     
     const resultado = await crearOferta(config.token, datosOferta);
     
     if (resultado.exito) {
         console.log(`      ✅ Creada: ${resultado.oferta.uuid.substring(0, 8)}...`);
         estadisticas.ofertasCreadas++;
-        estadisticas.capitalInvertido += cantidadUSD;
+        estadisticas.capitalInvertido += cantidadCUP;
         
         // Notificar creación
-        await notificarOfertaCreada(resultado.oferta, cantidadUSD, cantidadCUP, precioOptimo);
+        await notificarOfertaCreada(resultado.oferta, cantidadUSD, cantidadCUP, precioCompra);
         
         return resultado.oferta;
     } else {
@@ -359,9 +286,105 @@ async function crearOfertaEscalonada(cantidadUSD, preciosReferencia) {
 }
 
 /**
+ * Notificar cuando se crea una oferta
+ */
+async function notificarOfertaCreada(oferta, cantidadUSD, cantidadCUP, tasa) {
+    const emoji = '🟢';
+    
+    let mensaje = `${emoji} <b>OFERTA CREADA - COMPRA</b>\n\n`;
+    mensaje += `🆔 ID: ${oferta.uuid.substring(0, 8)}...\n`;
+    mensaje += `💰 Compro: ${cantidadUSD} USD por ${cantidadCUP} CUP\n`;
+    mensaje += `📊 Tasa: ${tasa.toFixed(2)} CUP/USD\n`;
+    mensaje += `💵 Moneda: ${MONEDA}\n`;
+    mensaje += `⏰ ${new Date().toLocaleTimeString('es-ES')}`;
+    
+    try {
+        await enviarPorTelegram(mensaje);
+    } catch (error) {
+        console.log(`   ⚠️  Error al enviar notificación: ${error.message}`);
+    }
+}
+
+/**
+ * Notificar cuando se detecta un peer en una oferta
+ */
+async function notificarPeerDetectado(oferta) {
+    const ofertaId = oferta.uuid;
+    const peerUuid = oferta.peer ? oferta.peer.uuid : null;
+    
+    if (!peerUuid) return;
+    
+    // Verificar si ya notificamos sobre este peer en esta oferta
+    const cacheKey = `${ofertaId}-${peerUuid}`;
+    if (peersNotificados.has(cacheKey)) {
+        return; // Ya notificado
+    }
+    
+    // Registrar en caché
+    peersNotificados.set(cacheKey, {
+        peer_uuid: peerUuid,
+        timestamp: Date.now()
+    });
+    
+    estadisticas.peersDetectados++;
+    
+    // Preparar mensaje
+    const emoji = '🟢';
+    const peerUsername = oferta.peer.username || 'Desconocido';
+    const amount = parseFloat(oferta.amount);
+    const receive = parseFloat(oferta.receive);
+    const tasa = (receive / amount).toFixed(2);
+    
+    let mensaje = `${emoji} <b>PEER DETECTADO - COMPRA</b>\n\n`;
+    mensaje += `🆔 Oferta: ${ofertaId.substring(0, 8)}...\n`;
+    mensaje += `💰 Compro: ${amount} USD por ${receive} CUP\n`;
+    mensaje += `📊 Tasa: ${tasa} CUP/USD\n`;
+    mensaje += `👤 Peer: @${peerUsername}\n`;
+    mensaje += `⏰ ${new Date().toLocaleTimeString('es-ES')}`;
+    
+    console.log(`\n   🎉 ¡PEER DETECTADO! Oferta ${ofertaId.substring(0, 8)}... - @${peerUsername}`);
+    console.log(`   📲 Enviando notificación...`);
+    
+    try {
+        await enviarPorTelegram(mensaje);
+        console.log(`   ✅ Notificación enviada`);
+    } catch (error) {
+        console.log(`   ⚠️  Error al enviar notificación: ${error.message}`);
+    }
+    
+    // Limpiar caché cada vez que notificamos
+    limpiarCachePeers();
+}
+
+/**
+ * Notificar cuando se renueva una oferta
+ */
+async function notificarOfertaRenovada(ofertaVieja, ofertaNueva, edad) {
+    const emoji = '🔄';
+    
+    const amount = parseFloat(ofertaNueva.amount);
+    const receive = parseFloat(ofertaNueva.receive);
+    const tasa = (receive / amount).toFixed(2);
+    
+    let mensaje = `${emoji} <b>OFERTA RENOVADA - COMPRA</b>\n\n`;
+    mensaje += `🆔 ID anterior: ${ofertaVieja.substring(0, 8)}...\n`;
+    mensaje += `🆔 ID nueva: ${ofertaNueva.uuid.substring(0, 8)}...\n`;
+    mensaje += `💰 Compro: ${amount} USD por ${receive} CUP\n`;
+    mensaje += `📊 Tasa: ${tasa} CUP/USD\n`;
+    mensaje += `⏱️  Sin peer por: ${edad} minutos\n`;
+    mensaje += `⏰ ${new Date().toLocaleTimeString('es-ES')}`;
+    
+    try {
+        await enviarPorTelegram(mensaje);
+    } catch (error) {
+        console.log(`   ⚠️  Error al enviar notificación: ${error.message}`);
+    }
+}
+
+/**
  * Verificar y renovar ofertas antiguas
  */
-async function verificarRenovaciones(misOfertas, preciosReferencia) {
+async function verificarRenovaciones(misOfertas, precioCompra) {
     const ofertasSinPeer = filtrarOfertasSinPeer(misOfertas);
     let renovadas = 0;
     
@@ -379,7 +402,7 @@ async function verificarRenovaciones(misOfertas, preciosReferencia) {
                 
                 // Recrear con precios actualizados
                 const cantidad = parseFloat(oferta.amount);
-                const ofertaNueva = await crearOfertaEscalonada(cantidad, preciosReferencia);
+                const ofertaNueva = await crearOfertaCompra(cantidad, precioCompra);
                 
                 if (ofertaNueva) {
                     // Notificar renovación
@@ -400,84 +423,47 @@ async function verificarRenovaciones(misOfertas, preciosReferencia) {
 }
 
 /**
- * Notificar peer detectado
- */
-async function notificarPeerDetectado(oferta) {
-    const uuid = oferta.uuid;
-    
-    if (peersNotificados.has(uuid)) {
-        return;
-    }
-    
-    peersNotificados.set(uuid, Date.now());
-    
-    const amount = parseFloat(oferta.amount);
-    const receive = parseFloat(oferta.receive);
-    const tasa = receive / amount;
-    
-    console.log(`\n   🎉 ¡PEER DETECTADO en oferta $${amount} USD!`);
-    console.log(`      UUID: ${uuid.substring(0, 8)}...`);
-    console.log(`      💰 ${amount} USD → ${receive} CUP`);
-    
-    try {
-        const oportunidad = {
-            tipo: oferta.type === 'buy' ? 'venta' : 'compra',
-            moneda: oferta.coin,
-            amount: amount,
-            receive: receive,
-            tasa: tasa.toFixed(2),
-            peer_id: oferta.peer_id,
-            uuid: uuid,
-            link: `https://qvapay.com/p2p/${uuid}`,
-            mensaje: `🎉 *¡OFERTA ACEPTADA!*\n\n` +
-                    `Tu oferta de *$${amount} USD* fue aceptada:\n\n` +
-                    `💰 *Monto:* ${amount} USD → ${receive} CUP\n` +
-                    `📊 *Tasa:* ${tasa.toFixed(2)} CUP/USD\n` +
-                    `💱 *Moneda:* ${oferta.coin}\n\n` +
-                    `👤 *Peer ID:* ${oferta.peer_id}\n\n` +
-                    `🔗 *Ver oferta:* https://qvapay.com/p2p/${uuid}`
-        };
-        
-        await notificarOportunidad(oportunidad);
-        console.log(`      📲 Notificación enviada`);
-        estadisticas.peersDetectados++;
-    } catch (error) {
-        console.error(`      ❌ Error al notificar:`, error.message);
-    }
-}
-
-/**
  * Ciclo principal
  */
 async function cicloGestor() {
     try {
         console.log('\n═══════════════════════════════════════════════════════');
-        console.log(`🔍 CICLO GESTOR - ${new Date().toLocaleString('es-ES')}`);
+        console.log(`🔍 CICLO GESTOR COMPRA - ${new Date().toLocaleString('es-ES')}`);
         console.log('═══════════════════════════════════════════════════════');
         
-        // 1. Obtener balance
-        console.log('\n💰 Obteniendo balance...');
-        const resultadoBalance = await obtenerBalance(config.token);
-        
-        if (!resultadoBalance.exito) {
-            console.log('   ❌ Error al obtener balance');
-            return;
-        }
-        
-        const balanceTotal = resultadoBalance.balance;
-        console.log(`   ✅ Balance total: $${balanceTotal.toFixed(2)} USD`);
-        
-        // 2. Calcular precios de referencia
+        // 1. Calcular precios de referencia
         console.log('\n📊 Calculando precios de referencia...');
         const preciosReferencia = await calcularPreciosReferencia();
         
-        if (!preciosReferencia || Object.keys(preciosReferencia).length === 0) {
+        if (!preciosReferencia || !preciosReferencia[MONEDA]) {
             console.log('   ⚠️  No se pudieron calcular precios de referencia');
             return;
         }
         
+        const precioCompra = preciosReferencia[MONEDA].precios.compra;
+        
         console.log('   ✅ Precios actualizados');
-        console.log(`   ${MONEDA}: Venta ${preciosReferencia[MONEDA].precios.venta.toFixed(2)} CUP/USD`);
+        console.log(`   ${MONEDA}: Compra ${precioCompra.toFixed(2)} CUP/USD`);
+        
+        // 2. Obtener balance en CUP
+        console.log('\n💰 Obteniendo balance CUP...');
+        let balanceCUP = await obtenerBalanceCUP();
+        
+        // Si se configuró un límite manual, usarlo
+        if (BALANCE_CUP_DISPONIBLE !== null) {
+            console.log(`   ⚙️  Balance MANUAL configurado: ${BALANCE_CUP_DISPONIBLE} CUP`);
+            console.log(`   💡 El gestor usará exactamente este monto (sin verificar disponibilidad real)`);
+            balanceCUP = BALANCE_CUP_DISPONIBLE;
+        } else {
+            console.log(`   🔍 Balance AUTOMÁTICO de la API: ${balanceCUP.toFixed(2)} CUP`);
+        }
+        
+        console.log(`   ✅ Balance CUP disponible: ${balanceCUP.toFixed(2)} CUP`);
+        
+        if (balanceCUP < precioCompra) {
+            console.log('   ⚠️  No hay suficiente CUP para crear ofertas (mínimo 1 USD)');
+            return;
+        }
         
         // 3. Obtener mis ofertas activas
         console.log('\n📋 Obteniendo mis ofertas...');
@@ -490,42 +476,42 @@ async function cicloGestor() {
         
         console.log(`   📊 Total ofertas activas: ${totalOfertasActivas}/15`);
         console.log(`   🎯 Modo configurado: ${modoConfigurado} (${configModo.descripcion})`);
-        console.log(`   📈 Límite ventas: ${configModo.maxVentas} ofertas`);
+        console.log(`   📈 Límite compras: ${configModo.maxCompras} ofertas`);
         
-        // Filtrar solo ofertas de VENTA de BANK_CUP para este gestor
-        const misOfertasVenta = misOfertas.filter(o => 
-            o.type === 'sell' && o.coin === MONEDA
+        // Filtrar solo ofertas de COMPRA de BANK_CUP
+        const misOfertasCompra = misOfertas.filter(o => 
+            o.type === 'buy' && o.coin === MONEDA
         );
         
-        const ofertasConPeer = filtrarOfertasConPeer(misOfertasVenta);
-        const ofertasSinPeer = filtrarOfertasSinPeer(misOfertasVenta);
+        const ofertasConPeer = filtrarOfertasConPeer(misOfertasCompra);
+        const ofertasSinPeer = filtrarOfertasSinPeer(misOfertasCompra);
         
         // Detectar peers
         for (const oferta of ofertasConPeer) {
             await notificarPeerDetectado(oferta);
         }
         
-        // Calcular capital bloqueado en ofertas de VENTA sin peer
-        const capitalBloqueado = ofertasSinPeer.reduce((sum, o) => sum + parseFloat(o.amount), 0);
-        const balanceDisponible = balanceTotal - capitalBloqueado;
+        // Calcular CUP bloqueado en ofertas sin peer
+        const cupBloqueado = ofertasSinPeer.reduce((sum, o) => sum + parseFloat(o.receive), 0);
+        const cupDisponible = balanceCUP - cupBloqueado;
         
-        console.log(`   📊 Ofertas venta con peer: ${ofertasConPeer.length}`);
-        console.log(`   📊 Ofertas venta sin peer: ${ofertasSinPeer.length}`);
-        console.log(`   💼 Capital bloqueado: $${capitalBloqueado.toFixed(2)}`);
-        console.log(`   💵 Balance disponible: $${balanceDisponible.toFixed(2)}`);
+        console.log(`   📊 Ofertas compra con peer: ${ofertasConPeer.length}`);
+        console.log(`   📊 Ofertas compra sin peer: ${ofertasSinPeer.length}`);
+        console.log(`   💼 CUP bloqueado: ${cupBloqueado.toFixed(2)} CUP`);
+        console.log(`   💵 CUP disponible: ${cupDisponible.toFixed(2)} CUP`);
         
-        // Verificar si podemos crear más ofertas de venta
-        const ofertasVentaActivas = misOfertasVenta.filter(o => o.status === 'open').length;
-        if (ofertasVentaActivas >= configModo.maxVentas) {
-            console.log(`\n⚠️  Ya tienes ${ofertasVentaActivas} ofertas de venta activas (máximo ${configModo.maxVentas})`);
-            console.log('   No se crearán más ofertas de venta en este ciclo');
+        // Verificar si podemos crear más ofertas de compra
+        const ofertasCompraActivas = misOfertasCompra.filter(o => o.status === 'open').length;
+        if (ofertasCompraActivas >= configModo.maxCompras) {
+            console.log(`\n⚠️  Ya tienes ${ofertasCompraActivas} ofertas de compra activas (máximo ${configModo.maxCompras})`);
+            console.log('   No se crearán más ofertas de compra en este ciclo');
             mostrarEstadisticas();
             return;
         }
         
         // 4. Verificar renovaciones
         console.log('\n🔄 Verificando renovaciones...');
-        const renovadas = await verificarRenovaciones(misOfertasVenta, preciosReferencia);
+        const renovadas = await verificarRenovaciones(misOfertasCompra, precioCompra);
         if (renovadas > 0) {
             console.log(`   ✅ ${renovadas} ofertas renovadas`);
         } else {
@@ -534,15 +520,15 @@ async function cicloGestor() {
         
         // 5. Crear nuevas ofertas según balance disponible
         console.log('\n📝 Calculando ofertas necesarias...');
-        const maxOfertasVenta = configModo.maxVentas;
-        const cantidadesACrear = calcularOfertasNecesarias(balanceDisponible, ofertasSinPeer, maxOfertasVenta);
+        const maxOfertasCompra = configModo.maxCompras;
+        const cantidadesACrear = calcularOfertasNecesarias(cupDisponible, precioCompra, ofertasSinPeer, maxOfertasCompra);
         
         if (cantidadesACrear.length > 0) {
             console.log(`   🚀 Creando ${cantidadesACrear.length} ofertas con delay de ${DELAY_ENTRE_OFERTAS/1000}s entre cada una...`);
             for (let i = 0; i < cantidadesACrear.length; i++) {
                 const cantidad = cantidadesACrear[i];
                 console.log(`\n   📦 Oferta ${i + 1}/${cantidadesACrear.length}:`);
-                await crearOfertaEscalonada(cantidad, preciosReferencia);
+                await crearOfertaCompra(cantidad, precioCompra);
                 
                 // Pausa entre ofertas (excepto en la última)
                 if (i < cantidadesACrear.length - 1) {
@@ -577,7 +563,7 @@ function mostrarEstadisticas() {
     console.log(`   ✅ Ofertas creadas: ${estadisticas.ofertasCreadas}`);
     console.log(`   🔄 Ofertas renovadas: ${estadisticas.ofertasRenovadas}`);
     console.log(`   🎉 Peers detectados: ${estadisticas.peersDetectados}`);
-    console.log(`   💰 Capital invertido: $${estadisticas.capitalInvertido.toFixed(2)}`);
+    console.log(`   💰 CUP invertido: ${estadisticas.capitalInvertido.toFixed(2)} CUP`);
 }
 
 /**
@@ -585,11 +571,11 @@ function mostrarEstadisticas() {
  */
 async function iniciar() {
     console.log('╔═══════════════════════════════════════════════════════╗');
-    console.log('║   🎯 GESTOR ESCALONADO DE OFERTAS P2P               ║');
+    console.log('║   🟢 GESTOR ESCALONADO DE COMPRAS P2P               ║');
     console.log('╚═══════════════════════════════════════════════════════╝\n');
     
     console.log('⚙️  CONFIGURACIÓN:');
-    console.log(`   • Tipo: ${TIPO_OFERTA.toUpperCase()}`);
+    console.log(`   • Tipo: COMPRA (yo compro USD)`);
     console.log(`   • Moneda: ${MONEDA}`);
     console.log(`   • Escala: ${ESCALA_OFERTAS.join(', ')} USD`);
     console.log(`   • Intervalo: ${INTERVALO_ESCANEO} segundos`);
@@ -599,14 +585,23 @@ async function iniciar() {
     const modoConfigurado = config.gestores.modoDistribucion;
     const configModo = config.gestores.modos[modoConfigurado];
     console.log(`   • Modo distribución: ${modoConfigurado} (${configModo.descripcion})`);
-    console.log(`   • Límite ofertas venta: ${configModo.maxVentas}/15 total`);
+    console.log(`   • Límite ofertas compra: ${configModo.maxCompras}/15 total`);
+    
+    if (BALANCE_CUP_DISPONIBLE !== null) {
+        console.log(`   • 💰 Balance CUP: MANUAL (${BALANCE_CUP_DISPONIBLE} CUP)`);
+        console.log(`     📝 Configurado en: config-gestor-compra.js`);
+    } else {
+        console.log(`   • 💰 Balance CUP: AUTOMÁTICO (desde API)`);
+        console.log(`     🔍 Se obtiene automáticamente de tu cuenta`);
+    }
     
     console.log('\n💡 ESTRATEGIA:');
-    console.log('   1. Crea ofertas siguiendo la escala predefinida');
-    console.log('   2. Respeta el límite de 15 ofertas activas totales');
-    console.log('   3. Usa todo el balance disponible dentro del límite');
-    console.log('   4. Fracciona el capital restante si no alcanza');
-    console.log('   5. Renueva ofertas sin peer automáticamente');
+    console.log('   1. Calcula precio óptimo de compra con tu estrategia');
+    console.log('   2. Determina cuánto USD puedes comprar con tu CUP');
+    console.log('   3. Respeta el límite de 15 ofertas activas totales');
+    console.log('   4. Crea ofertas siguiendo la escala predefinida');
+    console.log('   5. Detecta peers y notifica inmediatamente');
+    console.log('   6. Renueva ofertas sin peer automáticamente');
     
     console.log('\n🛑 Para detener: Presiona Ctrl+C\n');
     console.log('═══════════════════════════════════════════════════════\n');

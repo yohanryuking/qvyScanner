@@ -39,7 +39,7 @@ module.exports = {
             habilitada: true,                 // Activar/desactivar esta oferta
             
             // Mensaje opcional para el comprador/vendedor
-            mensaje: 'Operación rápida y segura. Respondo al instante.'
+            mensaje: 'puede ser otra cantidad, 56060886'
         },
         
         // Puedes agregar más ofertas aquí
@@ -87,5 +87,34 @@ module.exports = {
         
         // Intervalo para mostrar resumen (minutos)
         intervaloResumen: 60
+    },
+
+    // 🎯 CONFIGURACIÓN DE GESTORES ESCALONADOS
+    // Debido a la limitación de 15 ofertas activas totales en QvaPay
+    gestores: {
+        // Modo de distribución de ofertas activas (máximo 15 total)
+        // 'mixto': 8 compras + 7 ventas (recomendado)
+        // 'solo-ventas': 15 ventas (solo para vendedores)
+        // 'solo-compras': 15 compras (solo para compradores)
+        modoDistribucion: 'solo-ventas',
+        
+        // Configuración por modo
+        modos: {
+            mixto: {
+                maxCompras: 8,
+                maxVentas: 7,
+                descripcion: '8 ofertas de compra + 7 ofertas de venta'
+            },
+            'solo-ventas': {
+                maxCompras: 0,
+                maxVentas: 15,
+                descripcion: '15 ofertas de venta únicamente'
+            },
+            'solo-compras': {
+                maxCompras: 15,
+                maxVentas: 0,
+                descripcion: '15 ofertas de compra únicamente'
+            }
+        }
     }
 };

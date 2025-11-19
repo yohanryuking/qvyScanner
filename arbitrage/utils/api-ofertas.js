@@ -102,6 +102,8 @@ async function crearOferta(token, datosOferta) {
 
 /**
  * Cancelar/eliminar una oferta
+ * Endpoint: POST /p2p/{uuid}/cancel
+ * Según documentación: No retorna body en la respuesta
  */
 async function cancelarOferta(token, uuid) {
     const url = `${API_BASE_URL}/p2p/${uuid}/cancel`;
@@ -115,13 +117,36 @@ async function cancelarOferta(token, uuid) {
             }
         });
         
+        // La API no retorna body según documentación
+        // Solo verificamos el status code
         if (response.ok) {
-            return { exito: true };
+            // Status 200-299 = éxito
+            return { 
+                exito: true,
+                status: response.status
+            };
         } else {
-            const error = await response.text();
+            // Intentar obtener error del body si existe
+            let errorMsg = `HTTP ${response.status}`;
+            try {
+                const text = await response.text();
+                if (text) {
+                    // Intentar parsear como JSON
+                    try {
+                        const json = JSON.parse(text);
+                        errorMsg = json.message || json.error || text;
+                    } catch {
+                        errorMsg = text;
+                    }
+                }
+            } catch {
+                // Si no hay body, usar solo el status
+            }
+            
             return {
                 exito: false,
-                error: error || 'Error al cancelar'
+                error: errorMsg,
+                status: response.status
             };
         }
     } catch (error) {

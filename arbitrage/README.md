@@ -407,6 +407,27 @@ node arbitrage/calcular-precios.js
 node arbitrage/1-arbitraje-pagina-1.js
 ```
 
+### 🛠️ Gestor manual de ofertas
+
+Si quieres publicar ofertas manualmente a un precio fijo y en una escala definida, usa el script `gestor-ofertas-manual.js`.
+
+Ejemplo:
+```bash
+# Publicar ofertas de 1,2,5,10 USD a 495 CUP/USD, tipo venta (yo vendo USD)
+node arbitrage/gestor-ofertas-manual.js --price=495 --scale=1,2,5,10 --type=venta --coin=BANK_CUP --delay=3000
+```
+
+Opciones:
+- `--price`: Precio en CUP (ej: 495)
+- `--scale`: Lista CSV de cantidades USD a publicar (ej: 1,2,5,10,15)
+- `--type`: `venta` o `compra` (por defecto `venta`)
+- `--coin`: Moneda (ej: `BANK_CUP`)
+- `--delay`: Milisegundos de delay entre creación de ofertas (default 3000)
+- `--dry`: No crea ofertas, solo simula
+
+El script se encarga de evitar duplicados y respeta el límite de 15 ofertas activas en QvaPay. Para `venta` valida si tienes suficiente balance en USD.
+
+
 ### Uso Programático
 
 ```javascript
